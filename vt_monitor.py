@@ -34,7 +34,7 @@ SCAN_DELAY = float(config.get('SETTINGS', 'scan_delay', fallback=15))
 MONITOR_INTERVAL = int(config.get('SETTINGS', 'monitor_interval', fallback=5760))
 
 # ----------------------------------------------------------
-# 2. Juicy Patterns: Additional keywords & file extensions
+# 2. Juicy Patterns
 # ----------------------------------------------------------
 JUICY_FILE_EXTENSIONS = [
     '.zip', '.7z', '.exe', '.tar', '.gz', '.dll', '.iso',
@@ -46,6 +46,7 @@ SENSITIVE_KEYWORDS = [
     '.jsp', '.cgi', '.xml', '.txt', '.xhtml',
     'secret=', 'password=', 'pwd=', 'PRIVATE_KEY', 'RSA PRIVATE KEY'
 ]
+
 CREDENTIALS_REGEX = re.compile(r'(https?:\/\/[^\s\/]+\/:[^:\s]+:[^:\s]+)', re.IGNORECASE)
 
 # ----------------------------------------------------------
@@ -146,10 +147,11 @@ def update_last_scan(domain: str):
 
 def save_findings_to_db(domain: str, findings: List[str]):
     """
-    Save the discovered findings into 'scan_findings'.
+    Save the discovered findings into 'scan_findings', ignoring duplicates.
     """
     if not findings:
         return
+
     conn = None
     try:
         conn = get_db_connection()
@@ -158,6 +160,7 @@ def save_findings_to_db(domain: str, findings: List[str]):
                 cur.execute("""
                     INSERT INTO scan_findings (domain, finding)
                     VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
                 """, (domain, finding))
         conn.commit()
     except Exception as e:
@@ -168,7 +171,8 @@ def save_findings_to_db(domain: str, findings: List[str]):
 
 def get_findings_for_domain(domain: str) -> List[str]:
     """
-    Return all findings from 'scan_findings' for a specific domain.
+    Return all findings from 'scan_findings' for a specific domain,
+    ordered by found_at (descending).
     """
     conn = None
     findings = []
@@ -183,7 +187,9 @@ def get_findings_for_domain(domain: str) -> List[str]:
             rows = cur.fetchall()
             for row in rows:
                 finding_text, found_at = row
-                findings.append(f"[{found_at}] {finding_text}")
+                # We'll handle final formatting in the printing logic.
+                # Just store the data here.
+                findings.append((finding_text, found_at))
     except Exception as e:
         print(f"[ERROR] Cannot fetch findings for domain '{domain}': {e}")
     finally:
@@ -192,32 +198,32 @@ def get_findings_for_domain(domain: str) -> List[str]:
     return findings
 
 # ----------------------------------------------------------
-# 4. Core Scanning Logic
+# 4. Scanning & Parsing
 # ----------------------------------------------------------
 def search_juicy_data_in_string(text: str) -> List[str]:
     """
     Searches for any of the specified patterns in the given text.
     Returns a list of matched patterns or references.
     """
-    findings = []
+    results = []
 
     # 1. Check for file extensions
     for ext in JUICY_FILE_EXTENSIONS:
         if ext.lower() in text.lower():
-            findings.append(f"Found file extension '{ext}' in: {text}")
+            results.append(f"Found file extension '{ext}' in: {text}")
 
     # 2. Check for sensitive keywords
     for keyword in SENSITIVE_KEYWORDS:
         if keyword.lower() in text.lower():
-            findings.append(f"Found keyword '{keyword}' in: {text}")
+            results.append(f"Found keyword '{keyword}' in: {text}")
 
-    # 3. Check for credentials pattern
+    # 3. Check for credential patterns
     creds_match = CREDENTIALS_REGEX.findall(text)
     if creds_match:
         for match in creds_match:
-            findings.append(f"Potential leaked credential pattern in: {match}")
+            results.append(f"Potential leaked credential pattern in: {match}")
 
-    return findings
+    return results
 
 def parse_vt_response(domain: str, json_data: dict) -> List[str]:
     """
@@ -282,9 +288,9 @@ def scan_domain(domain: str, api_key: str) -> List[str]:
     return []
 
 # ----------------------------------------------------------
-# 5. Discord Notification
+# 5. Discord Notification (with chunking to avoid 2000 limit)
 # ----------------------------------------------------------
-def send_discord_notification(message: str):
+def send_discord_notification(content: str):
     """
     Send a message to Discord via the webhook if it's configured.
     """
@@ -292,8 +298,9 @@ def send_discord_notification(message: str):
         print("[WARN] Discord webhook not configured.")
         return
 
+    # Basic HTTP post with JSON
     payload = {
-        "content": message
+        "content": content
     }
     try:
         r = requests.post(DISCORD_WEBHOOK, json=payload)
@@ -301,6 +308,28 @@ def send_discord_notification(message: str):
             print(f"[ERROR] Discord message status: {r.status_code}, Text: {r.text}")
     except Exception as e:
         print(f"[ERROR] Exception while sending Discord message: {e}")
+
+def send_discord_in_chunks(message: str, max_len: int = 2000):
+    """
+    Discord's 'content' field must be <= 2000 chars.
+    We'll split our message into multiple chunks if needed.
+    """
+    lines = message.split("\n")
+    chunk = ""
+    for line in lines:
+        # If adding this line exceeds the limit, send the current chunk first.
+        if len(chunk) + len(line) + 1 > max_len:
+            send_discord_notification(chunk)
+            chunk = ""
+        # Add a newline if 'chunk' isn't empty
+        if chunk:
+            chunk += "\n" + line
+        else:
+            chunk = line
+
+    # Send the remaining chunk
+    if chunk:
+        send_discord_notification(chunk)
 
 # ----------------------------------------------------------
 # 6. Round-Robin API Key Handling
@@ -328,10 +357,13 @@ def single_scan(domains: List[str]):
         findings = scan_domain(domain, api_key)
         if findings:
             print(f"\n[+] Juicy Findings for domain: {domain}")
+            # Print each finding, separated by lines
             for finding in findings:
                 print(f"    {finding}")
+                print("="*100)
         else:
-            print(f"[-] No juicy data found for domain: {domain}")
+            print(f"\n[-] No juicy data found for domain: {domain}")
+
         time.sleep(SCAN_DELAY)
 
 # ----------------------------------------------------------
@@ -340,42 +372,35 @@ def single_scan(domains: List[str]):
 def monitor_scan():
     """
     Periodically scans all domains in the 'monitored_domains' table.
-    Any new findings are saved to DB and posted to Discord (if any).
+    Any new findings are saved to DB and posted to Discord in chunks.
     """
-    print(f"[INFO] Running monitor scan at {datetime.utcnow()}")
     domains = get_monitored_domains()
     if not domains:
         print("[INFO] No domains to monitor.")
         return
 
-    new_findings = []
-
     for domain in domains:
+        # For each domain, show a line with domain + timestamp
+        print(f"[INFO] Scanning domain: {domain} at {datetime.utcnow()}")
         api_key = get_next_apikey()
         findings = scan_domain(domain, api_key)
 
-        # Save to DB
+        # Save to DB (only new findings) + update last scan
         if findings:
             save_findings_to_db(domain, findings)
-            # Accumulate them to send in one Discord message at the end
-            new_findings.append((domain, findings))
 
-        # Update last_scan timestamp
+            # Build a Discord message for this domain
+            # We'll do a short header + the findings
+            lines = [f"**Monitoring Report for** `{domain}`:\n"]
+            for f in findings:
+                lines.append(f"- {f}")
+            final_message = "\n".join(lines)
+
+            # Send in chunks to Discord if too large
+            send_discord_in_chunks(final_message)
+
         update_last_scan(domain)
-
-        # Respect rate limit
         time.sleep(SCAN_DELAY)
-
-    # Send aggregated findings to Discord
-    if new_findings:
-        message_lines = ["**VirusTotal Monitoring Report**\n"]
-        for domain, f_list in new_findings:
-            message_lines.append(f"**Domain:** {domain}")
-            for f in f_list:
-                message_lines.append(f" - {f}")
-            message_lines.append("")  # blank line
-        final_message = "\n".join(message_lines)
-        send_discord_notification(final_message)
 
 def start_monitoring():
     """
@@ -422,14 +447,14 @@ def main():
     parser_add.add_argument('-f', '--file', help="File containing domains to add")
 
     # ------------------------------------------------------
-    # 10b. Single-scan Mode (Scan once and exit)
+    # 10b. Single-scan Mode
     # ------------------------------------------------------
     parser_scan = subparsers.add_parser('scan', help="Perform a one-time scan of provided domains")
     parser_scan.add_argument('-d', '--domain', help="Single domain to scan")
     parser_scan.add_argument('-f', '--file', help="File containing domains to scan")
 
     # ------------------------------------------------------
-    # 10c. Monitoring Command (4-day interval by default)
+    # 10c. Monitoring Command
     # ------------------------------------------------------
     parser_monitor = subparsers.add_parser('monitor', help="Run the monitoring scheduler")
 
@@ -439,7 +464,7 @@ def main():
     parser_list = subparsers.add_parser('list', help="List all monitored domains")
 
     # ------------------------------------------------------
-    # 10e. Remove Domain(s) from Monitoring
+    # 10e. Remove Domain(s)
     # ------------------------------------------------------
     parser_remove = subparsers.add_parser('remove', help="Remove domain(s) from monitoring list")
     parser_remove.add_argument('-d', '--domain', help="Single domain to remove")
@@ -528,11 +553,12 @@ def main():
             sys.exit(1)
 
         for d in target_domains:
-            records = get_findings_for_domain(d)
-            if records:
+            domain_findings = get_findings_for_domain(d)
+            if domain_findings:
                 print(f"\n[Records for domain: {d}]")
-                for rec in records:
-                    print(f"  {rec}")
+                for (finding_text, found_at) in domain_findings:
+                    print(f"{finding_text}")
+                    print("="*100)
             else:
                 print(f"\n[No findings recorded for domain: {d}]")
 
